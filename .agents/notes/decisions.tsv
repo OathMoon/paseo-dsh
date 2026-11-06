@@ -1,0 +1,38 @@
+ts	phase	decision	why	evidence	result
+2026-11-06T00:00:00+08:00	frame	继续已有阶段 1，落实审批取消和工具详情	计划已记录阶段 1 实施，不重复创建 provider	DSH-PROVIDER-PLAN.md:3	open
+2026-11-06T00:00:00+08:00	design	保留 SDK command 模式并包装 resolved launch	connector 缺少 launch 和会话环境，无法保留既有语义	../paseo/packages/plugin/src/server/acp-internal/connection.ts:405	open
+2026-11-06T01:27:20.4241286Z	correction	前两行时间为初始化占位值，不是实测时间	保留追加历史并更正时间含义	decisions.tsv:2	SUPERSEDED timestamps only
+2026-11-06T01:27:20.4241286Z	baseline	阶段1在独立daemon复验通过	先确认既有文本链和工作目录仍成立	C:/Users/Administrator/AppData/Local/Temp/tmpdimu0s.tmp/transcript.txt	VERIFIED
+2026-11-06T01:27:20.4241286Z	compat	加入自包含stdio兼容并保留SDK command模式	仅补缺失审批输入和标准工具结果，不代答审批	server/bridge.ts	VERIFIED by stage1 and permission probe
+2026-11-06T01:27:20.4241286Z	verification	实际插件SDK回放缺字段和显式字段审批均通过	缺字段必须产生事件且允许拒绝optionId必须原样返回	probes/permission.mjs	VERIFIED
+2026-11-06T01:27:20.4241286Z	verification	12项子进程协议测试与类型检查通过	检查Windows脚本参数环境EOF失败退出和线上字段	 tests/compat.test.ts	VERIFIED
+2026-11-06T01:27:20.4241286Z	stage4	Beta工具详情停止后继续reload和remove通过	从真实daemon验证SDK复用行为与清理	C:/Users/Administrator/AppData/Local/Temp/tmpnquxpv.tmp/after-stop.txt	VERIFIED
+2026-11-06T01:27:20.4241286Z	credentials	使用既有凭据文件入口执行真实模型验收	用户明确授权使用本机DSH凭据，不复制密钥	probes/stage2.ps1	open
+2026-11-06T01:39:10.1692614Z	stage2	生产DSH在普通目录与git worktree真实模型读写通过	直接对比随机标记与输出并核对原生工具和两轮UUID	C:/Users/Administrator/AppData/Local/Temp/paseo-dsh-stage2-3eba40e3fe6d44a4a47b4be86af7493b/verification-summary.json	VERIFIED
+2026-11-06T01:39:10.1692614Z	harness	修正stage2标记预置的PowerShell参数并在请求前断言文件值	首次模型诚实报告文件缺失，不能把夹具错误归于provider	probes/stage2.ps1:85	VERIFIED on second run
+2026-11-06T01:39:10.1692614Z	harness	修正stage4等待结果字段为toolCallId	callId误写导致验证假超时	probes/stage4.ps1	VERIFIED
+2026-11-06T01:39:10.1692614Z	stage3	唯一callId揭露取消后旧审批残留	固定ID覆盖旧请求会造成假通过	C:/Users/Administrator/AppData/Local/Temp/paseo-dsh-stage3-be165949d46747ca9789083e7c43d997	FAILED baseline
+2026-11-06T01:39:10.1692614Z	compat	终态先释放SDK权限再发host终态且仅撤回RPC映射cancelled	避免旧卡片和SDK Map增长，保留正常用户决定	server/permissions.ts	VERIFIED by snapshot and initial live run
+2026-11-06T01:39:10.1692614Z	review	补空content失败错误和对应回归	空数组投影为空串会绕开通用错误兜底	tests/compat.test.ts	13 tests green
+2026-11-06T01:39:10.1692614Z	stage4	最终版本Beta工具详情停止后继续及空闲reloadremove通过	验证新增权限层未破坏文本和生命周期	C:/Users/Administrator/AppData/Local/Temp/tmpy55pcg.tmp/result.json	VERIFIED
+2026-11-06T01:39:10.1692614Z	harness	审批reload的清理检查改为reload前PID	新一代目录探针应与旧运行进程区分	probes/stage3.ps1	open rerun
+2026-11-06T01:39:10.1692614Z	review	顺序断言先确认resolved事件存在	索引负一不能被当成早于终态 tprobes/permission.mjs	VERIFIED structure
+2026-11-06T01:39:42.4488483Z	correction	上一review行缺证据列分隔符，此行补正	追加更正并保留原记录	probes/permission.mjs	resolvedIndex非负和先于canceled断言已加入
+2026-11-06T01:40:20.9550514Z	stage3	最终唯一ID审批取消后继续及审批中reload通过	按reload前PID核对旧进程退出并直接读DSH cancelled审计	C:/Users/Administrator/AppData/Local/Temp/paseo-dsh-stage3-b92e4409cff44d719000dcb115d068d2/checks.jsonl	VERIFIED
+2026-11-06T01:41:22.8074485Z	review	同模型独立审查确认主实现并修正两项回归门槛	本机未提供技能指定跨家族模型，不虚称跨模型审查	EXECUTION.md	reviewed; empty-content and resolved-index checks fixed
+2026-11-06T01:41:22.8074485Z	cleanup	删除首轮标记预置错误产生的四个测试文件	核对创建时间和内容均指向本轮测试目录	probes/stage2.ps1:85	workspace clean of stray markers
+2026-11-06T01:43:20.4295114Z	scope	明确reload后旧会话需新建，未开启原生恢复能力	DSH resume与SDK load及历史回放不等价，按计划留阶段6	README.md	documented limitation
+2026-11-06T01:44:03.7021996Z	lifecycle	运行中MCP工具reload后旧进程回收，旧timeline加载被拒绝	现有provider未协商session.persistence，不能将恢复失败当进程泄漏或假称工具终态已读	C:/Users/Administrator/AppData/Local/Temp/tmpft1kbt.tmp/running-tool.jsonl	process cleanup VERIFIED; old timeline INCONCLUSIVE
+2026-11-06T01:50:29.1639146Z	lifecycle	运行中工具reload后九个旧进程退出，新会话完成，最终无残留	检查真实PID和MCP标记，不把新目录探针计为旧进程	C:/Users/Administrator/AppData/Local/Temp/tmpcl2lzg.tmp/result.json	VERIFIED except terminal tool row
+2026-11-06T01:50:29.1639146Z	scope	旧工具卡片终态保留未验证，未开启原生恢复	host只发turn_failed且缺session.persistence，不虚称卡片收尾	C:/Users/Administrator/AppData/Local/Temp/tmpcl2lzg.tmp/active-tool-events.jsonl	NOT VERIFIED; documented
+2026-11-06T01:50:29.1639146Z	handoff	完成本次实现和证据核对，保留UI及POSIX验收边界	类型检查和13协议测试通过，真实模型与独立daemon已核对	EXECUTION.md	ready for local directory use; limitations explicit
+2026-11-06T07:43:42.0672018Z	bug	复现Desktop选择provider时报ACP connection closed	实际host使用Paseo.exe且launch环境剥离Electron Node模式	tests/desktop-launch.test.ts	FAILED before fix: ACP connection closed
+2026-11-06T07:43:42.0672018Z	fix	仅桥接进程启用Electron Node模式，启动DSH前恢复原值	Fix Root Causes将修复放在自启动环境边界，避免污染下游	index.server.ts:23	17 tests pass; typecheck pass
+2026-11-06T07:43:42.0672018Z	verification	reload实际host上的paseo-dsh后工作区目录返回五个模型	对报错host和同一cwd验证，不以隔离daemon替代	.artifacts/desktop-catalog.json	VERIFIED; error null; diagnostic Ready
+2026-11-06T07:43:42.0672018Z	scope	窗口捕获超时且曾返回错误应用，停止原生UI输入	不使用错误窗口控件，保留实际Desktop daemon验证边界	EXECUTION.md	visual selection NOT VERIFIED
+2026-11-06T09:34:13.1494657Z	bug	空闲运行时回收后原聊天加载失败	SDK保存句柄但未协商persistence；DSH只有resume缺少load重放	server/dsh-history.mjs	REPRODUCED: Provider does not support session.persistence
+2026-11-06T09:34:13.1494657Z	design	使用原生resume和官方持久化接口实现ACP load	保留原UUID和上下文，不修改用户profile和会话文件	server/history-launch.ts	临时patch克隆有效配置；修正name作为匹配条件的误用
+2026-11-06T09:34:13.1494657Z	verification	类型检查及全部22项测试通过	含原生load优先、失败不伪造成功和历史顺序	tests/history.test.ts	PASS; no skipped tests
+2026-11-06T09:34:13.1494657Z	verification	两次进程重启后恢复并续聊	独立存储、唯一工具ID、核对第二条回复保留首轮记忆	probes/history.mjs	PASS; evidence: paseo-dsh-history-I52fiZ/events.json
+2026-11-06T09:34:13.1494657Z	verification	实际Desktop原聊天历史恢复	同一原生UUID，23条目和14条已完成工具	.artifacts/actual-history-refresh.json	PASS; 原生UI刷新后错误及重试按钮消失
+2026-11-06T10:33:17.076225+00:00	docs	项目记录迁入.agents/notes并提供中英双语版本	保留历史日志和证据路径，根目录保留中英文README	.agents/notes/INDEX.md	文档迁移；无运行时代码变更
