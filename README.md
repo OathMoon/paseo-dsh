@@ -2,7 +2,7 @@
 
 [中文](README.md) | [English](README.en.md)
 
-在 Paseo 中使用 DeepSeek Harness。当前安装方式为本地目录插件，Paseo 版本限定为 `0.15.2`，provider ID 为 `dsh`。
+在 Paseo 中使用 DeepSeek Harness。当前安装方式为本地目录插件，Paseo 版本要求使用 `*`，允许安装到各正式版本，provider ID 为 `dsh`。
 
 ## 安装
 
@@ -21,16 +21,22 @@ paseo plugin ls
 
 ## 当前行为
 
-- 文本、推理和同一活动会话的连续回合。
-- 工作区内模型选择。
-- 工具成功正文和原始失败详情。没有内容的失败显示通用错误。
-- 一次性允许和拒绝。停止等待审批的回合会撤回审批，线上结果为 `cancelled`。
-- 停止后可继续输入。插件 reload 和 remove 由 SDK 回收子进程。
-- 恢复原生 DSH 会话并重放历史；空闲回收或进程重启后，可继续原聊天。
+插件现已升级为 **Paseo Direct Provider + DSH 原生 Cordis 桥接插件**（兼容 `acp` 与 `sdk` profile），不再受限于 ACP 最小公分母协议：
 
-DSH 的正文可以在消息块提交后出现。没有实现逐 token 转发。会话恢复已在 DSH 0.2.2-rc.1 验证：插件通过原生 resume 恢复上下文，使用 DSH 持久化接口读取历史，并实现 ACP load 的历史重放语义。临时启动补丁保留有效 ACP 配置，不修改用户 profile 或会话文件。没有实现 rewind，也没有承诺多根目录或额外附件。Paseo 0.15.2 对 provider 主动结束的审批可能显示默认拒绝标签，DSH 收到的取消结果仍是 `cancelled`。
-
-运行中工具被 reload 打断时，已验证旧进程退出和新会话可用。本次 host 没有发出旧工具卡片的终态更新，因此卡片收尾未通过验收。
+- **逐 token 流式正文与推理**：直连 `agent/assistant-stream` 增量推送，并与落盘 `assistant/message` 自动去重；重试/放弃的 attempt 使用独立 `messageId`。
+- **富工具卡片**：自动将 DSH 原生工具映射为 Paseo 的 `shell` / `read` / `edit` / `write` / `search` / `fetch` / `sub_agent` 卡片，MCP 及扩展工具保留原始输入输出与错误详情。
+- **权限模式与动态配置**：工作区内模型目录、推理强度（`thinkingOption`）与 `permissionPresets` -> Paseo `modes` 动态切换。
+- **高阶交互**：
+  - `prompt.steer`：运行中向 `agent.steer` / `next-step` 插话而不中断当前回合。
+  - `session.commands` + `prompt.command`：暴露并执行 DSH 原生斜杠命令（如 `/permission`、`/compact`、`/goal` 等），支持 `compaction` 时间线项。
+  - `session.revert.conversation`：基于 `@deepseek-ai/dsh-session/fork` 的 `buildForkSeed` 生成新 UUID fork 会话并更新持久化句柄，保持原会话日志只读。
+  - `user-question/ask` -> `session.permission (kind: "question")`：完整支持结构化用户提问与取消。
+  - `session.subsession`：转发子代理父子会话生命周期与事件流。
+- **稳定性与向后兼容**：
+  - 延续 `{ version: 1, data: { sessionId } }` 持久化句柄格式，旧会话无缝重放续聊。
+  - `reload` / `close` / 进程异常退出时主动对运行中工具补发终态卡片（`activeToolTerminalObserved=true`）并取消所有挂起审批。
+  - 直接通过 `@getpaseo/plugin/server` 的 `spawnProcess` / `terminateProcess` 启动 `dsh`，不再经由 Electron `process.execPath --eval` 中转。
+  - 可通过设置环境变量 `PASEO_DSH_ENGINE=acp` 临时回退至旧 ACP 兼容模式。
 
 ## 验证
 
@@ -40,18 +46,17 @@ DSH 的正文可以在消息块提交后出现。没有实现逐 token 转发。
 npm ci
 npm run typecheck
 npm test
-node probes/permission.mjs
-node probes/acp.mjs
-node probes/history.mjs
+node probes/bridge.mjs
+node probes/direct-e2e.mjs
 ```
 
-`permission.mjs` 使用相邻 `deepseek-harness` 仓库的真实审批快照，经过当前插件及 SDK，验证允许、拒绝、取消、终态顺序和迟到回复。`acp.mjs` 使用该仓库既有 CLI 构建及免密 control-surface 夹具，验证文本、工具结果、目录和按目录列举。
-
-`history.mjs` 使用同一 DSH 构建和独立临时存储，验证两次进程重启、原生 UUID 保持、消息与工具历史、续聊读取先前上下文，以及错误目录和无效会话必须失败。历史单元测试也需要相邻仓库的既有 DSH 构建，用于加载官方中断恢复函数。当前类型检查和 22 项测试通过；实际 Desktop 原聊天已恢复，界面的历史刷新错误已消失。
+- `probes/bridge.mjs`（阶段 0）：使用自包含免密夹具与本机 `dsh` 验证 `bridge/init` → `catalog/get` → `session/open` → MCP 工具与流式输出 → `turn/cancel` → 进程重启后 `session/resume` 历史重放，stdout 零杂音。
+- `probes/direct-e2e.mjs`（阶段 1–3）：经由 `index.server.ts` 注册的 Direct Provider 端到端验证 `status()`、能力协商、工作区目录与权限模式、逐 token 流式去重、动态模型/模式切换、原生斜杠命令、工具审批、`user-question` 提问、运行中 `steer` 插话、`buildForkSeed` 对话回退、`reload` 运行中工具终态收尾（`activeToolTerminalObserved=true`）以及 `session.list` / 错误目录拒绝。
+- 旧 ACP 兼容回归（`probes/permission.mjs`、`probes/acp.mjs`、`probes/history.mjs` 与 `probes/stage1.ps1`–`stage4.ps1`）继续保留。
 
 Windows 的 SDK 会调用 `taskkill /T /F`。在禁止结束子进程树的沙箱中运行探针会失败。
 
-以下脚本启动各自的临时 daemon，不改动现有 daemon。`PaseoCli` 是 npm 包 `@getpaseo/cli@0.15.2` 的 `bin/paseo` 文件。
+以下脚本启动各自的临时 daemon，不改动现有 daemon。`PaseoCli` 是待验证版本的 npm 包 `@getpaseo/cli` 的 `bin/paseo` 文件。开发依赖锁定的 SDK 版本用于可重复的类型检查；实际兼容性以目标版本的验收结果为准。
 
 ```powershell
 ./probes/stage1.ps1 -PaseoCli <bin/paseo>

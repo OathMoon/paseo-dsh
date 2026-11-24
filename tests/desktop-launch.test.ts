@@ -11,7 +11,7 @@ test('Desktop Electron runs the ACP bridge as Node and preserves the target laun
   skip: !existsSync(electron), timeout: 20000,
 }, async () => {
   const child = spawn(electron, [fileURLToPath(new URL('./fixtures/desktop-host.mjs', import.meta.url)), process.execPath], {
-    windowsHide: true, stdio: 'pipe', env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+    windowsHide: true, stdio: 'pipe', env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', PASEO_DSH_ENGINE: 'acp' },
   });
   let stdout = '';
   let stderr = '';

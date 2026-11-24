@@ -1,5 +1,5 @@
 param([Parameter(Mandatory)][string]$PaseoCli)
-# Run with PowerShell 7 and the bin/paseo file of @getpaseo/cli 0.15.2.
+# Run with PowerShell 7 and the bin/paseo file of the Paseo CLI under test.
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
 $cli = (Resolve-Path $PaseoCli).Path
@@ -28,7 +28,7 @@ $slowMarker = Join-Path $root 'running-tool.jsonl'
 # Inject the fixture through session/new so DSH awaits the MCP mount before session.ready.
 $fixturePlugin = Join-Path $root 'fixture-plugin'
 $null = New-Item -ItemType Directory -Path $fixturePlugin
-Set-Content (Join-Path $fixturePlugin 'paseo-plugin.json') '{"id":"stage1-fixture","requirements":{"paseo":"0.15.2"}}'
+Set-Content (Join-Path $fixturePlugin 'paseo-plugin.json') '{"id":"stage1-fixture","requirements":{"paseo":"*"}}'
 @"
 export default function contribute(server) {
   server.addHook("agent.open.before", ({ request }) => {

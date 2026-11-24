@@ -7,6 +7,7 @@ Installation, usage, and verification commands live in the root READMEs. This di
 | 内容 / Document | 中文 | English |
 |---|---|---|
 | 接入设计与分阶段验收 / Integration design and staged acceptance | [DSH-PROVIDER-PLAN.md](DSH-PROVIDER-PLAN.md) | [DSH-PROVIDER-PLAN.en.md](DSH-PROVIDER-PLAN.en.md) |
+| Direct Provider 升级方案 / Direct Provider upgrade plan | [DIRECT-PROVIDER-UPGRADE-PLAN.md](DIRECT-PROVIDER-UPGRADE-PLAN.md) | [DIRECT-PROVIDER-UPGRADE-PLAN.en.md](DIRECT-PROVIDER-UPGRADE-PLAN.en.md) |
 | 当前结果、证据与限制 / Results, evidence, and limitations | [EXECUTION.md](EXECUTION.md) | [EXECUTION.en.md](EXECUTION.en.md) |
 | 按时间追加的决策日志 / Chronological decision log | [decisions.tsv](decisions.tsv) | [decisions.en.tsv](decisions.en.tsv) |
 

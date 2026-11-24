@@ -1,4 +1,4 @@
 {
   "id": "paseo-dsh",
-  "requirements": { "paseo": "0.15.2" }
+  "requirements": { "paseo": "*" }
 }

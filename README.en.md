@@ -2,7 +2,7 @@
 
 [中文](README.md) | [English](README.en.md)
 
-Use DeepSeek Harness in Paseo through a local directory plugin. The supported Paseo version is `0.15.2`; the provider ID is `dsh`.
+Use DeepSeek Harness in Paseo through a local directory plugin. The Paseo version requirement is `*`, allowing installation on any stable release. The provider ID is `dsh`.
 
 ## Installation
 
@@ -21,16 +21,22 @@ DSH reads credentials. The plugin neither copies keys nor provides an ACP login 
 
 ## Current behavior
 
-- Text, reasoning, and consecutive turns in the same active session.
-- Model selection within a workspace.
-- Successful tool output and original failure details. Failures without content show a generic error.
-- One-time allow and reject. Stopping a turn waiting for approval withdraws the request and returns `cancelled` on the wire.
-- Further input after stopping. The SDK cleans up child processes on plugin reload and removal.
-- Native DSH session recovery and history replay after idle collection or process restart.
+The plugin now runs as a **Paseo Direct Provider + native DSH Cordis bridge plugin** (supporting both `acp` and `sdk` profiles), bypassing the ACP bottleneck:
 
-DSH may emit text after committing a message block. Token streaming is not implemented. Recovery was verified with DSH 0.2.2-rc.1: native resume restores context, and the plugin reads history through DSH's persistence interface to implement ACP load replay. A temporary launch patch preserves the effective ACP configuration without modifying user profiles or session files. Rewind is not implemented; multiple roots and additional attachment types are outside the verified scope. Paseo 0.15.2 may show a default reject label for approvals ended by the provider, although DSH receives `cancelled`.
-
-Reload during a running tool was verified to terminate the old processes and allow a new session. The host did not emit a terminal update for the old tool card, so immediate card completion remains unverified.
+- **Token-level streaming & deduplication**: subscribes directly to `agent/assistant-stream` for incremental text and reasoning updates, deduplicating committed `assistant/message` events and isolating retried/abandoned attempts.
+- **Rich tool cards**: maps native DSH tools to Paseo `shell`, `read`, `edit`, `write`, `search`, `fetch`, and `sub_agent` cards, while preserving raw inputs/outputs and original error details for MCP and extension tools.
+- **Permission modes & dynamic configuration**: workspace model catalog, `thinkingOption` (reasoning effort), and `permissionPresets` mapped to Paseo `modes`.
+- **Advanced interactive capabilities**:
+  - `prompt.steer`: injects mid-turn steering input without cancelling the active turn.
+  - `session.commands` + `prompt.command`: advertises and executes native DSH slash commands (`/permission`, `/compact`, `/goal`, etc.) and emits `compaction` timeline items.
+  - `session.revert.conversation`: forks a new UUID session via `@deepseek-ai/dsh-session/fork`'s `buildForkSeed` and updates `session.persistence` without mutating the original log.
+  - `user-question/ask` -> `session.permission (kind: "question")`: full structured question and cancellation loop.
+  - `session.subsession`: forwards parent-child subagent session lifecycles and event streams.
+- **Reliability & backwards compatibility**:
+  - Preserves `{ version: 1, data: { sessionId } }` persistence handles for seamless replay and continuation of existing chats.
+  - Terminalizes running tool cards (`activeToolTerminalObserved=true`) and cancels pending permissions on `reload`, `close`, or unexpected process exit.
+  - Spawns `dsh` directly via `@getpaseo/plugin/server`'s `spawnProcess` / `terminateProcess` without an Electron `--eval` hop.
+  - Emergency fallback to the legacy ACP bridge is available via `PASEO_DSH_ENGINE=acp`.
 
 ## Verification
 
@@ -40,18 +46,17 @@ Use Node `>=24.9.0` and PowerShell 7.
 npm ci
 npm run typecheck
 npm test
-node probes/permission.mjs
-node probes/acp.mjs
-node probes/history.mjs
+node probes/bridge.mjs
+node probes/direct-e2e.mjs
 ```
 
-`permission.mjs` passes real approval snapshots from the sibling `deepseek-harness` repository through this plugin and the SDK. It checks allow, reject, cancel, terminal ordering, and late responses. `acp.mjs` uses that repository's existing CLI build and keyless control-surface fixture to check text, tool results, catalogs, and listing by directory.
-
-`history.mjs` uses the same DSH build with isolated temporary storage. It checks two process restarts, stable native UUIDs, message and tool history, continued access to earlier context, and rejection of invalid directories and session handles. History unit tests also need the sibling DSH build to load its official interrupted-turn recovery function. Type checking and all 22 tests passed. The original Desktop conversation recovered, and the history refresh error disappeared from the UI.
+- `probes/bridge.mjs` (Stage 0): self-contained keyless fixture against the installed `dsh` binary verifying `bridge/init` -> `catalog/get` -> `session/open` -> MCP tool + streaming -> `turn/cancel` -> restart `session/resume` replay with zero stdout noise.
+- `probes/direct-e2e.mjs` (Stages 1–3): end-to-end verification through `index.server.ts` covering `status()`, capability negotiation, workspace catalog & permission modes, token streaming deduplication, dynamic model/mode/thinking configuration, native slash commands, tool approvals, structured user questions, mid-turn steering, `buildForkSeed` conversation revert, active tool terminalization on close/reload (`activeToolTerminalObserved=true`), and `session.list` / invalid-cwd rejection.
+- Legacy ACP regression probes (`probes/permission.mjs`, `probes/acp.mjs`, `probes/history.mjs`, and `probes/stage1.ps1`–`stage4.ps1`) remain available.
 
 On Windows, the SDK calls `taskkill /T /F`. Probes fail in sandboxes that prohibit terminating child process trees.
 
-The following scripts start separate temporary daemons and leave the existing daemon unchanged. `PaseoCli` is the `bin/paseo` file from `@getpaseo/cli@0.15.2`.
+The following scripts start separate temporary daemons and leave the existing daemon unchanged. `PaseoCli` is the `bin/paseo` file from the version of `@getpaseo/cli` under test. The development SDK stays locked for reproducible type checking. Runtime compatibility is established by acceptance tests on the target version.
 
 ```powershell
 ./probes/stage1.ps1 -PaseoCli <bin/paseo>

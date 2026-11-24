@@ -75,3 +75,15 @@ Type checking and all 22 tests passed. Evidence in `paseo-dsh-history-I52fiZ` ch
 On the actual Desktop host, only `paseo-dsh` was reloaded. The daemon was not restarted and no prompt was sent to the original conversation. Paseo conversation `33a8ffe0-4f20-4ac5-801f-92de10926b5a` retained native UUID `6097da4a-e7da-4e76-80e0-808232bee60c`. Its timeline returned 23 items: one user message, seven reasoning items, fourteen completed tools, and one assistant answer. The native window accessibility tree first showed the error. After refresh, the original messages remained and the error and retry control disappeared.
 
 This does not establish full Pi parity, rewind, or immediate terminal tool updates during reload. The new history implementation did not receive a completed independent final review; earlier reviews apply only to their original scope.
+
+---
+
+## Direct Provider Upgrade Execution Record (2026-11-24)
+
+Implemented and verified Stages 0–4 from [DIRECT-PROVIDER-UPGRADE-PLAN.en.md](DIRECT-PROVIDER-UPGRADE-PLAN.en.md) (environment: Windows, Node 25.8.0, installed `dsh 0.2.2-rc.5`):
+
+- **Stage 0 (Direct Bridge Foundation)**: Added `server/protocol.ts`, `server/launch.ts` (compatible with both `acp` and `sdk` profiles, disabling `acp` or `sdk-jsonrpc-server` stdout rows), and `server/dsh-bridge-plugin.mjs` (synchronous `stdin` buffering + dynamic capability probing). `node probes/bridge.mjs` passed with zero stdout noise.
+- **Stage 1 (Direct Provider Replacement)**: Added `server/connection.ts`, `server/session.ts`, and updated `index.server.ts` (`status()` diagnostics and `PASEO_DSH_ENGINE=acp` fallback switch), preserving `{ version: 1, data: { sessionId } }` handles and terminalizing active tools on `close()` / unexpected exit (`activeToolTerminalObserved=true`).
+- **Stage 2 (Core Experience Upgrade)**: Added token-level streaming via `agent/assistant-stream` with committed `assistant/message` deduplication, rich tool cards (`server/mappers/tools.ts`), model/thinking/permission-preset mapping (`server/mappers/config.ts`), and image/attachment formatting (`server/mappers/content.ts`).
+- **Stage 3 (Advanced Interactions)**: Added `prompt.steer`, `session.commands` + `prompt.command` + `compaction` items, `session.revert.conversation` (forking a new UUID via `buildForkSeed` with `isSeeded: true` while leaving the original log read-only), and `user-question/ask` -> `session.permission (kind: "question")`. All 10 gates in `node probes/direct-e2e.mjs` passed.
+- **Stage 4 (Subsessions & Wrap-up)**: Added `session.subsession` parent-child forwarding and `sub_agent` cards, verified `dsh --profile sdk` direct bridge startup, and updated `README.md`, `README.en.md`, and `tests/direct-provider.test.ts` (28 unit tests + strict `tsc --noEmit` green).

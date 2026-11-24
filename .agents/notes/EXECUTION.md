@@ -89,3 +89,15 @@
 实际 Desktop 仅 reload 了 `paseo-dsh`，没有重启 daemon，没有向原聊天发送提示。原聊天 `33a8ffe0-4f20-4ac5-801f-92de10926b5a` 恢复后仍使用原生 UUID `6097da4a-e7da-4e76-80e0-808232bee60c`，返回 23 个时间线条目：1 条用户消息、7 条推理、14 条已完成工具和 1 条回复。通过原生窗口辅助功能树，先观察到错误提示，刷新后确认原消息与回复保留，错误和重试按钮消失。此项是实际界面验证，补充此前仅 daemon 请求的证据。
 
 本次不声明 Pi 全部能力等价，也不包含 rewind 或运行中 reload 的即时工具卡片终态验收。最终新增历史实现未完成独立审查，原审查记录仅适用于此前范围。
+
+---
+
+## Direct Provider 升级执行记录（2026-11-24）
+
+依据 [DIRECT-PROVIDER-UPGRADE-PLAN.md](DIRECT-PROVIDER-UPGRADE-PLAN.md) 完成阶段 0–4 实施与验证（环境：Windows，Node 25.8.0，本机 `dsh 0.2.2-rc.5`）：
+
+- **阶段 0（桥接底座）**：实现 `server/protocol.ts`、`server/launch.ts`（兼容 `acp` 与 `sdk` profile，自动识别并禁用 `acp` / `sdk-jsonrpc-server` 行）、`server/dsh-bridge-plugin.mjs`（同步挂载 `stdin` 防首帧丢失、动态能力探测）。`node probes/bridge.mjs` 通过，stdout 零杂音。
+- **阶段 1（Direct Provider 平替）**：实现 `server/connection.ts`、`server/session.ts`、`index.server.ts`（含 `status()` 诊断与 `PASEO_DSH_ENGINE=acp` 回退开关），保留 `{ version: 1, data: { sessionId } }` 历史句柄格式；在 `close()` / 异常退出时主动对运行中工具补发终态卡片，`activeToolTerminalObserved=true` 通过。
+- **阶段 2（核心体验跃升）**：实现 `agent/assistant-stream` 逐 token 流式推送与落盘 `assistant/message` 去重、`server/mappers/tools.ts` 富工具卡片、`server/mappers/config.ts`（模型、推理强度、`permissionPresets` -> Paseo `modes`）与 `server/mappers/content.ts`（图片及 Review/PR/Issue/文件附件格式化）。
+- **阶段 3（高阶交互解锁）**：实现 `prompt.steer`（运行中插话）、`session.commands` + `prompt.command` + `compaction` 卡片、`session.revert.conversation`（基于 `buildForkSeed` + `isSeeded: true` 生成新 UUID fork 会话且不改动原日志）与 `user-question/ask` -> `session.permission (kind: "question")`。`node probes/direct-e2e.mjs` 10 项门禁全绿。
+- **阶段 4（子代理树与工程收口）**：实现 `session.subsession` 父子会话树与 `sub_agent` 卡片转发；验证 `dsh --profile sdk` 直连桥接启动；更新 `README.md`、`README.en.md` 与 `tests/direct-provider.test.ts`（28 项单元测试 + `tsc --noEmit` 全绿）。
