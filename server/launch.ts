@@ -1,6 +1,7 @@
+import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
-import { existsSync } from "node:fs";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { existsSync, realpathSync } from "node:fs";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, parse, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -15,7 +16,9 @@ const dshPackageSchema = z.object({
   version: z.string().optional(),
 });
 
+const DUMP_CONFIG_CACHE_TTL_MS = 60_000;
 const patchCache = new Map<string, Promise<string>>();
+const dumpConfigCache = new Map<string, { expiresAt: number; promise: Promise<PreparedDshBridgeLaunch> }>();
 
 export interface PreparedDshBridgeLaunch {
   launch: ProviderLaunch;
@@ -45,7 +48,17 @@ async function readDshPackage(directory: string): Promise<{ version: string } | 
 export function resolveLaunchCommand(launch: ProviderLaunch): string | undefined {
   if (isAbsolute(launch.command)) return existsSync(launch.command) ? launch.command : undefined;
   const searchPath = Object.entries(launch.env).find(([key]) => key.toLowerCase() === "path")?.[1];
-  const extensions = process.platform === "win32" ? ["", ".exe", ".cmd", ".bat"] : [""];
+  let extensions: string[];
+  if (process.platform === "win32") {
+    const pathExtRaw = Object.entries(launch.env).find(([key]) => key.toLowerCase() === "pathext")?.[1];
+    const parsedExts = (pathExtRaw ?? ".COM;.EXE;.BAT;.CMD")
+      .split(";")
+      .map((ext) => ext.trim().toLowerCase())
+      .filter((ext) => ext.startsWith("."));
+    extensions = [...new Set(parsedExts), ""];
+  } else {
+    extensions = [""];
+  }
   for (const directory of searchPath?.split(delimiter) ?? []) {
     if (!directory) continue;
     for (const extension of extensions) {
@@ -68,6 +81,27 @@ export async function findDshAnchor(launch: ProviderLaunch): Promise<DshAnchorIn
   if (!command || !/^dsh(?:\.(?:cmd|bat|exe|[cm]?js))?$/iu.test(parse(command).base)) {
     return undefined;
   }
+
+  // Follow symlinks (common on macOS/Linux global installs) and walk up to locate @deepseek-ai/dsh.
+  let realCommand = command;
+  try {
+    realCommand = realpathSync(command);
+  } catch {
+    // Keep original command path if realpath fails.
+  }
+  let cursor = dirname(realCommand);
+  for (let depth = 0; depth < 6; depth++) {
+    const pkg = await readDshPackage(cursor);
+    if (pkg) {
+      const anchor = join(cursor, "lib", "bin.js");
+      if (existsSync(anchor)) return { anchor, version: pkg.version };
+    }
+    const parent = dirname(cursor);
+    if (parent === cursor) break;
+    cursor = parent;
+  }
+
+  // Fallback for Windows npm shims (<prefix>/dsh.cmd -> <prefix>/node_modules/@deepseek-ai/dsh).
   const packageDirectory = join(dirname(command), "node_modules", "@deepseek-ai", "dsh");
   const pkg = await readDshPackage(packageDirectory);
   if (!pkg) return undefined;
@@ -131,8 +165,6 @@ async function createBridgePatch(
   profile: string,
   stdoutRows: readonly YAMLMap[],
 ): Promise<string> {
-  const directory = await mkdtemp(join(tmpdir(), "paseo-dsh-bridge-"));
-  const modulePath = join(directory, "paseo-dsh-bridge.mjs");
   const anchorUrl = pathToFileURL(anchor).href;
   const moduleSource = [
     'import { createRequire } from "node:module";',
@@ -142,7 +174,6 @@ async function createBridgePatch(
     `export function apply(ctx, config) { return (${applyDshBridge.toString()})(ctx, config ?? {}, require); }`,
     "",
   ].join("\n");
-  await writeFile(modulePath, moduleSource, "utf8");
 
   const patchItems: unknown[] = [];
   for (const row of stdoutRows) {
@@ -153,6 +184,17 @@ async function createBridgePatch(
   }
   const route = extractDefaultRoute(stdoutRows);
   const inject = extractInjectList(stdoutRows);
+  const digest = createHash("sha256")
+    .update(moduleSource)
+    .update("\0")
+    .update(JSON.stringify({ profile, dshVersion, route, inject, ids: stdoutRows.map((r) => r.get("id")) }))
+    .digest("hex")
+    .slice(0, 16);
+  const directory = join(tmpdir(), `paseo-dsh-bridge-${digest}`);
+  await mkdir(directory, { recursive: true });
+  const modulePath = join(directory, "paseo-dsh-bridge.mjs");
+  await writeFile(modulePath, moduleSource, "utf8");
+
   patchItems.push({
     insert: [
       {
@@ -198,41 +240,74 @@ export async function prepareDshBridgeLaunch(
   // Verify core DSH LLM package is resolvable from this anchor before spawning.
   createRequire(anchorInfo.anchor).resolve("@deepseek-ai/dsh-llm");
 
-  const dump = await execCommand(launch.command, [...launch.args, "--dump-config"], {
-    env: launch.env,
-    timeout: 45_000,
-    maxBuffer: 16 * 1024 * 1024,
-  });
-  const document = parseDocument(dump.stdout, {
-    customTags: [{ tag: "tag:yaml.org,2002:js", resolve: (value: string) => value }],
-  });
-  if (document.errors.length > 0) {
-    throw new Error(`Unable to parse DSH effective configuration: ${document.errors[0]?.message}`);
-  }
-  const stdoutRows = findStdoutServerRows(document.contents);
-  const profile = detectProfileName(launch.args);
-  const cacheKey = [
+  const envKey = Object.entries(launch.env)
+    .filter(([k]) => /^(?:DSH_|DEEPSEEK_|HOME$|USERPROFILE$|XDG_)/i.test(k))
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([k, v]) => `${k}=${v}`)
+    .join("\0");
+  const dumpKey = [
+    launch.command,
+    ...launch.args,
     anchorInfo.anchor,
     anchorInfo.version,
-    profile,
-    ...stdoutRows.map((row) => row.toString()),
+    envKey,
   ].join("\0");
 
-  let pending = patchCache.get(cacheKey);
-  if (!pending) {
-    pending = createBridgePatch(anchorInfo.anchor, anchorInfo.version, profile, stdoutRows);
-    patchCache.set(cacheKey, pending);
-    void pending.catch(() => {
-      patchCache.delete(cacheKey);
-    });
+  const now = Date.now();
+  const cached = dumpConfigCache.get(dumpKey);
+  if (cached && cached.expiresAt > now) {
+    const resolved = await cached.promise;
+    return {
+      ...resolved,
+      launch: { ...launch, args: [...launch.args, "--patch", resolved.launch.args.at(-1)!] },
+    };
   }
-  const patchPath = await pending;
-  return {
-    launch: { ...launch, args: [...launch.args, "--patch", patchPath] },
-    anchor: anchorInfo.anchor,
-    profile,
-    dshVersion: anchorInfo.version,
-  };
+
+  const promise = (async (): Promise<PreparedDshBridgeLaunch> => {
+    const dump = await execCommand(launch.command, [...launch.args, "--dump-config"], {
+      env: launch.env,
+      timeout: 45_000,
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    const document = parseDocument(dump.stdout, {
+      customTags: [{ tag: "tag:yaml.org,2002:js", resolve: (value: string) => value }],
+    });
+    if (document.errors.length > 0) {
+      throw new Error(`Unable to parse DSH effective configuration: ${document.errors[0]?.message}`);
+    }
+    const stdoutRows = findStdoutServerRows(document.contents);
+    const profile = detectProfileName(launch.args);
+    const cacheKey = [
+      anchorInfo.anchor,
+      anchorInfo.version,
+      profile,
+      ...stdoutRows.map((row) => row.toString()),
+    ].join("\0");
+
+    let pending = patchCache.get(cacheKey);
+    if (!pending) {
+      pending = createBridgePatch(anchorInfo.anchor, anchorInfo.version, profile, stdoutRows);
+      patchCache.set(cacheKey, pending);
+      void pending.catch(() => {
+        patchCache.delete(cacheKey);
+      });
+    }
+    const patchPath = await pending;
+    return {
+      launch: { ...launch, args: [...launch.args, "--patch", patchPath] },
+      anchor: anchorInfo.anchor,
+      profile,
+      dshVersion: anchorInfo.version,
+    };
+  })();
+
+  dumpConfigCache.set(dumpKey, { expiresAt: now + DUMP_CONFIG_CACHE_TTL_MS, promise });
+  void promise.catch(() => {
+    if (dumpConfigCache.get(dumpKey)?.promise === promise) {
+      dumpConfigCache.delete(dumpKey);
+    }
+  });
+  return promise;
 }
 
 export async function inspectDshStatus(launch?: ProviderLaunch): Promise<ProviderStatus> {

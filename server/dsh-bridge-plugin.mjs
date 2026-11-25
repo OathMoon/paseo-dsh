@@ -78,6 +78,23 @@ export function applyDshBridge(ctx, config, require) {
     return error instanceof Error ? error.message : String(error);
   }
 
+  function isRetryableAgentError(error) {
+    if (!error || typeof error !== "object") return false;
+    if (error.retryable === true) return true;
+    const code =
+      typeof error.code === "string"
+        ? error.code
+        : typeof error.failure?.code === "string"
+          ? error.failure.code
+          : undefined;
+    if (!code) return false;
+    const codes = dshLlm?.LLM_FAILURE_CODES;
+    if (codes && typeof codes === "object" && codes[code]?.retryChoice === true) {
+      return true;
+    }
+    return false;
+  }
+
   function rpcError(code, message) {
     const err = new Error(message);
     err.rpcCode = code;
@@ -129,27 +146,38 @@ export function applyDshBridge(ctx, config, require) {
     });
   }
 
-  async function sameDirectory(left, right) {
-    if (left === undefined) return false;
+  async function normalizeDir(dir) {
+    if (dir === undefined) return undefined;
     try {
-      const [realLeft, realRight] = await Promise.all([realpath(left), realpath(right)]);
-      return realLeft === realRight;
+      return await realpath(dir);
     } catch {
-      return resolve(left) === resolve(right);
+      return resolve(dir);
+    }
+  }
+
+  async function sameDirectory(left, right) {
+    if (left === undefined || right === undefined) return false;
+    const [normLeft, normRight] = await Promise.all([normalizeDir(left), normalizeDir(right)]);
+    return normLeft === normRight;
+  }
+
+  function findRootRecord(agent) {
+    if (!agent) return undefined;
+    const direct = sessions.get(String(agent.session.id));
+    if (direct?.agent === agent) return direct;
+    const subagents = ctx.get("subagents");
+    if (!subagents || typeof subagents.rootOf !== "function") return undefined;
+    try {
+      const root = subagents.rootOf(agent);
+      const rootRecord = sessions.get(String(root.session.id));
+      return rootRecord?.agent === root ? rootRecord : undefined;
+    } catch {
+      return undefined;
     }
   }
 
   function ownsAgent(agent) {
-    const record = sessions.get(agent.session.id);
-    if (record?.agent === agent) return true;
-    const subagents = ctx.get("subagents");
-    if (!subagents || typeof subagents.rootOf !== "function") return false;
-    try {
-      const root = subagents.rootOf(agent);
-      return sessions.get(root.session.id)?.agent === root;
-    } catch {
-      return false;
-    }
+    return findRootRecord(agent) !== undefined;
   }
 
   function normalizeServerName(name) {
@@ -225,7 +253,10 @@ export function applyDshBridge(ctx, config, require) {
     }
   }
 
-  async function buildCatalog(currentSelection) {
+  let cachedCatalogBase = null;
+
+  async function getCatalogBase() {
+    if (cachedCatalogBase) return cachedCatalogBase;
     const llm = ctx.llm;
     const providers = await Promise.all(
       llm.listProviders().map(async (provider) => {
@@ -277,6 +308,35 @@ export function applyDshBridge(ctx, config, require) {
       }),
     );
 
+    const permissionPresetsService = ctx.get("permissionPresets");
+    let permissionPresets;
+    if (permissionPresetsService && typeof permissionPresetsService.catalog === "function") {
+      try {
+        const cat = permissionPresetsService.catalog();
+        permissionPresets = {
+          defaultPreset: cat.defaultPreset,
+          options: cat.options.map((opt) => ({
+            id: opt.value,
+            name: opt.name,
+            ...(opt.description !== undefined ? { description: opt.description } : {}),
+          })),
+        };
+      } catch {
+        permissionPresets = undefined;
+      }
+    }
+
+    cachedCatalogBase = {
+      providers: providers.filter((p) => p.models.length > 0),
+      permissionPresets,
+    };
+    return cachedCatalogBase;
+  }
+
+  async function buildCatalog(currentSelection) {
+    const llm = ctx.llm;
+    const { providers, permissionPresets } = await getCatalogBase();
+
     let defaultSelection = currentSelection;
     if (!defaultSelection && defaultProvider && defaultModel) {
       try {
@@ -299,26 +359,8 @@ export function applyDshBridge(ctx, config, require) {
       }
     }
 
-    const permissionPresetsService = ctx.get("permissionPresets");
-    let permissionPresets;
-    if (permissionPresetsService && typeof permissionPresetsService.catalog === "function") {
-      try {
-        const cat = permissionPresetsService.catalog();
-        permissionPresets = {
-          defaultPreset: cat.defaultPreset,
-          options: cat.options.map((opt) => ({
-            id: opt.value,
-            name: opt.name,
-            ...(opt.description !== undefined ? { description: opt.description } : {}),
-          })),
-        };
-      } catch {
-        permissionPresets = undefined;
-      }
-    }
-
     return {
-      providers: providers.filter((p) => p.models.length > 0),
+      providers,
       ...(defaultSelection ? { defaultSelection } : {}),
       ...(permissionPresets ? { permissionPresets } : {}),
     };
@@ -447,35 +489,6 @@ export function applyDshBridge(ctx, config, require) {
     return result;
   }
 
-  async function serializeEventForWire(event) {
-    // Rehydrate image attachments inline when needed, keeping all other fields intact.
-    if (event.type === "assistant/message" && Array.isArray(event.data?.message?.content)) {
-      const attachments = ctx.get("attachments");
-      const content = await Promise.all(
-        event.data.message.content.map(async (block) => {
-          if (block.type === "image" && block.attachment && attachments) {
-            try {
-              const stored = await attachments.readImage(block.attachment);
-              return {
-                type: "image",
-                data: Buffer.from(stored.data).toString("base64"),
-                mimeType: stored.ref.mediaType,
-              };
-            } catch {
-              return block;
-            }
-          }
-          return block;
-        }),
-      );
-      return {
-        ...event,
-        data: { ...event.data, message: { ...event.data.message, content } },
-      };
-    }
-    return event;
-  }
-
   function createSessionRecord(handle, cwd) {
     const agent = handle.agent;
     const record = {
@@ -543,23 +556,28 @@ export function applyDshBridge(ctx, config, require) {
     );
   }
 
+  function trackToolLifecycle(targetRecord, event) {
+    if (event.type === "tool/call" && event.data?.callId) {
+      let parsedInput;
+      try {
+        parsedInput = JSON.parse(event.data.arguments);
+      } catch {
+        parsedInput = event.data.arguments;
+      }
+      targetRecord.toolInputs.set(event.data.callId, parsedInput);
+    } else if (event.type === "tool/result" && event.data?.message?.toolCallId) {
+      targetRecord.toolInputs.delete(event.data.message.toolCallId);
+    }
+  }
+
   disposers.push(
     ctx.on("session/event", (session, event) => {
       const sessionId = String(session.id);
       const record = sessions.get(sessionId);
       if (record && record.agent.session === session) {
-        if (event.type === "tool/call" && event.data?.callId) {
-          let parsedInput;
-          try {
-            parsedInput = JSON.parse(event.data.arguments);
-          } catch {
-            parsedInput = event.data.arguments;
-          }
-          record.toolInputs.set(event.data.callId, parsedInput);
-        }
-        record.enqueue(async () => {
-          const wireEvent = await serializeEventForWire(event);
-          notify("event/session", { sessionId, event: wireEvent });
+        trackToolLifecycle(record, event);
+        record.enqueue(() => {
+          notify("event/session", { sessionId, event });
         });
         return;
       }
@@ -567,13 +585,13 @@ export function applyDshBridge(ctx, config, require) {
       if (parentSessionId) {
         const parentRecord = sessions.get(parentSessionId);
         if (parentRecord) {
-          parentRecord.enqueue(async () => {
-            const wireEvent = await serializeEventForWire(event);
+          trackToolLifecycle(parentRecord, event);
+          parentRecord.enqueue(() => {
             notify("event/session", {
               sessionId,
               parentSessionId,
               isSubagent: true,
-              event: wireEvent,
+              event,
             });
           });
         }
@@ -605,6 +623,7 @@ export function applyDshBridge(ctx, config, require) {
 
   disposers.push(
     ctx.on("agent/error", ({ agent, error }) => {
+      if (isRetryableAgentError(error)) return;
       const sessionId = String(agent.session.id);
       const record = sessions.get(sessionId);
       if (record?.agent !== agent) return;
@@ -627,6 +646,22 @@ export function applyDshBridge(ctx, config, require) {
 
   disposers.push(
     ctx.on("llm/adapters-updated", () => {
+      cachedCatalogBase = null;
+      for (const record of sessions.values()) {
+        void buildSessionState(record)
+          .then((state) => {
+            if (!closed && !record.closing) {
+              notify("event/config", { sessionId: state.sessionId, state });
+            }
+          })
+          .catch(() => {});
+      }
+    }),
+  );
+
+  disposers.push(
+    ctx.on("llm/models-updated", () => {
+      cachedCatalogBase = null;
       for (const record of sessions.values()) {
         void buildSessionState(record)
           .then((state) => {
@@ -654,6 +689,7 @@ export function applyDshBridge(ctx, config, require) {
 
   disposers.push(
     ctx.on("permission-presets/catalog-changed", () => {
+      cachedCatalogBase = null;
       for (const record of sessions.values()) {
         void buildSessionState(record)
           .then((state) => {
@@ -668,17 +704,16 @@ export function applyDshBridge(ctx, config, require) {
 
   disposers.push(
     ctx.on("approval/request", (request, next) => {
-      if (!ownsAgent(request.agent)) return next();
+      const rootRecord = findRootRecord(request.agent);
+      if (!rootRecord) return next();
       const sessionId = String(request.agent.session.id);
-      const record = sessions.get(sessionId);
-      const rootRecord = record ?? [...sessions.values()].find((r) => ownsAgent(request.agent));
-      const drain = rootRecord ? rootRecord.outputTail : Promise.resolve();
+      const drain = rootRecord.outputTail;
       const signal = request.signal
         ? AbortSignal.any([request.signal, lifetime.signal])
         : lifetime.signal;
       return drain
         .then(() => {
-          const input = request.callId && record ? record.toolInputs.get(request.callId) : undefined;
+          const input = request.callId ? rootRecord.toolInputs.get(request.callId) : undefined;
           return requestHost(
             "approval/request",
             {
@@ -832,11 +867,12 @@ export function applyDshBridge(ctx, config, require) {
           throw rpcError(-32602, `cwd must be an absolute path: ${cwd}`);
         }
         const limit = typeof params?.limit === "number" && params.limit > 0 ? params.limit : 100;
+        const targetCwd = cwd ? await normalizeDir(cwd) : undefined;
         const listed = await persistence.list();
         const filtered = await Promise.all(
           listed.map(async ({ header }) => {
             if (header.origin === "subagent" || !header.cwd || !isAbsolute(header.cwd)) return undefined;
-            if (cwd && !(await sameDirectory(header.cwd, cwd))) return undefined;
+            if (targetCwd && (await normalizeDir(header.cwd)) !== targetCwd) return undefined;
             return {
               sessionId: String(header.id),
               cwd: header.cwd,
@@ -848,7 +884,7 @@ export function applyDshBridge(ctx, config, require) {
         );
         const entries = filtered
           .filter(Boolean)
-          .sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
+          .sort((a, b) => (b.updatedAt ?? b.createdAt ?? 0) - (a.updatedAt ?? a.createdAt ?? 0));
         return { sessions: entries.slice(0, limit) };
       }
 
@@ -928,7 +964,7 @@ export function applyDshBridge(ctx, config, require) {
             const closers = typeof dshSession?.interruptedTurnClosers === "function"
               ? dshSession.interruptedTurnClosers(rawEvents)
               : [];
-            replayEvents = await Promise.all([...rawEvents, ...closers].map(serializeEventForWire));
+            replayEvents = [...rawEvents, ...closers];
           }
           const parsedModel = parseModelSelection(params?.model);
           const agentOptions = {
@@ -959,8 +995,14 @@ export function applyDshBridge(ctx, config, require) {
           });
           const record = createSessionRecord(handle, cwd);
           sessions.set(sessionId, record);
-          if (replayEvents) {
-            notify("event/replay", { sessionId, events: replayEvents });
+          if (replayEvents && replayEvents.length > 0) {
+            const CHUNK_SIZE = 200;
+            for (let i = 0; i < replayEvents.length; i += CHUNK_SIZE) {
+              notify("event/replay", {
+                sessionId,
+                events: replayEvents.slice(i, i + CHUNK_SIZE),
+              });
+            }
           }
           return await buildSessionState(record);
         } finally {
@@ -1036,14 +1078,20 @@ export function applyDshBridge(ctx, config, require) {
           source: { kind: "user" },
         });
         if (params?.delivery === "steer") {
-          if (typeof agent.steer === "function") {
-            agent.steer(message);
-          } else {
-            agent.inbox.append("next-step", message);
-          }
+          setImmediate(() => {
+            if (closed || record.closing) return;
+            if (typeof agent.steer === "function") {
+              agent.steer(message);
+            } else {
+              agent.inbox.append("next-step", message);
+            }
+          });
           return { kind: "steer", messageId: String(message.id) };
         }
-        agent.followup(message);
+        setImmediate(() => {
+          if (closed || record.closing) return;
+          agent.followup(message);
+        });
         return { kind: "turn", messageId: String(message.id) };
       }
 

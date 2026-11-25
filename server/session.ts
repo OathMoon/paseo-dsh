@@ -1,4 +1,5 @@
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import type { Readable, Writable } from "node:stream";
 import type { JsonValue } from "@getpaseo/protocol/agent-types";
 import { spawnProcess, terminateProcess } from "@getpaseo/plugin/server";
 import type {
@@ -16,7 +17,13 @@ import type {
 import { randomUUID } from "node:crypto";
 import { toProviderConfigState } from "./mappers/config.ts";
 import { mapProviderContentToBridgeBlocks } from "./mappers/content.ts";
-import { buildToolCallDetail, extractToolOutputText, parseToolArguments, toJsonValue } from "./mappers/tools.ts";
+import {
+  buildToolCallDetail,
+  extractToolOutputText,
+  extractUserMessageText,
+  parseToolArguments,
+  toJsonValue,
+} from "./mappers/tools.ts";
 import { prepareDshBridgeLaunch } from "./launch.ts";
 import {
   BridgeApprovalRequestParamsSchema,
@@ -32,13 +39,20 @@ import {
   type BridgeUserQuestionItem,
 } from "./protocol.ts";
 
+const PROMPT_TIMEOUT_MS = 60_000;
+const COMMAND_TIMEOUT_MS = 120_000;
+const DEFAULT_STREAM_COALESCE_MS = 32;
+
 type ToolCallTimelineItem = Extract<ProviderTimelineItem, { type: "tool_call" }>;
 
 interface StreamAttemptState {
+  targetSessionId: string;
   textId: string;
   text: string;
+  dirtyText: boolean;
   reasoningId: string;
   reasoning: string;
+  dirtyReasoning: boolean;
 }
 
 interface PendingApproval {
@@ -61,6 +75,16 @@ export interface DshSessionRuntimeOptions {
   baseLaunch: ProviderLaunch;
   env: Readonly<Record<string, string>>;
   startupTimeoutMs: number;
+  streamCoalesceMs?: number;
+  emit(event: ProviderEvent): void;
+}
+
+export interface DshStreamRuntimeOptions {
+  boundarySessionId: string;
+  writable: Writable;
+  readable: Readable;
+  startupTimeoutMs?: number;
+  streamCoalesceMs?: number;
   emit(event: ProviderEvent): void;
 }
 
@@ -121,16 +145,25 @@ async function settlesWithin(promise: Promise<void>, timeoutMs: number): Promise
 export class DshSessionRuntime {
   readonly boundarySessionId: string;
   private readonly emit: (event: ProviderEvent) => void;
-  private readonly child: ChildProcessWithoutNullStreams;
+  private readonly child: ChildProcessWithoutNullStreams | null;
   readonly peer: BridgeRpcPeer;
   readonly initInfo: BridgeInitResult;
 
   nativeSessionId = "";
   cwd = "";
+  private mcpServers: BridgeMcpServer[] = [];
+  private currentModelId: string | undefined;
+  private currentMode: string | undefined;
+  private currentThinkingOption: string | undefined;
+  private contextWindowMaxTokens: number | undefined;
   private imageSupported = false;
   private closing = false;
   private processFailed = false;
   private stderrTail = "";
+  private readonly streamCoalesceMs: number;
+  private streamFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  private lastStreamFlushAt = 0;
+  private readonly dirtyStreamKeys = new Set<string>();
 
   private activeTurnId: string | null = null;
   private pendingPromptClientMessageId: string | null = null;
@@ -152,7 +185,11 @@ export class DshSessionRuntime {
     const spawnFailure = new Promise<never>((_resolve, reject) => {
       child.once("error", reject);
     });
-    const runtime = new DshSessionRuntime(child, options);
+    const runtime = new DshSessionRuntime(child, child.stdin, child.stdout, {
+      boundarySessionId: options.boundarySessionId,
+      emit: options.emit,
+      streamCoalesceMs: options.streamCoalesceMs,
+    });
     try {
       const rawInit = await Promise.race([
         runtime.peer.request("bridge/init", {}, options.startupTimeoutMs),
@@ -172,13 +209,46 @@ export class DshSessionRuntime {
     }
   }
 
+  static async fromStreams(options: DshStreamRuntimeOptions): Promise<DshSessionRuntime> {
+    const runtime = new DshSessionRuntime(null, options.writable, options.readable, {
+      boundarySessionId: options.boundarySessionId,
+      emit: options.emit,
+      streamCoalesceMs: options.streamCoalesceMs,
+    });
+    try {
+      const rawInit = await runtime.peer.request(
+        "bridge/init",
+        {},
+        options.startupTimeoutMs ?? 10_000,
+      );
+      const initInfo = BridgeInitResultSchema.parse(rawInit);
+      if (initInfo.protocolVersion !== 1) {
+        throw new Error(
+          `Unsupported DSH bridge protocol version ${initInfo.protocolVersion} (DSH ${initInfo.dshVersion})`,
+        );
+      }
+      (runtime as { initInfo: BridgeInitResult }).initInfo = initInfo;
+      return runtime;
+    } catch (error) {
+      await runtime.close("failed");
+      throw error;
+    }
+  }
+
   private constructor(
-    child: ChildProcessWithoutNullStreams,
-    options: DshSessionRuntimeOptions,
+    child: ChildProcessWithoutNullStreams | null,
+    writable: Writable,
+    readable: Readable,
+    options: {
+      boundarySessionId: string;
+      emit: (event: ProviderEvent) => void;
+      streamCoalesceMs?: number;
+    },
   ) {
     this.boundarySessionId = options.boundarySessionId;
     this.emit = options.emit;
     this.child = child;
+    this.streamCoalesceMs = options.streamCoalesceMs ?? DEFAULT_STREAM_COALESCE_MS;
     this.initInfo = {
       protocolVersion: 1,
       dshVersion: "unknown",
@@ -194,25 +264,26 @@ export class DshSessionRuntime {
       },
     };
 
-    child.stderr.on("data", (chunk: Buffer) => {
-      const text = chunk.toString("utf8");
-      this.stderrTail = (this.stderrTail + text).slice(-4096);
-    });
-
-    this.peer = new BridgeRpcPeer(child.stdin, child.stdout, {
+    this.peer = new BridgeRpcPeer(writable, readable, {
       onNotification: (method, params) => this.handleNotification(method, params),
       onRequest: (method, params) => this.handleHostRequest(method, params),
     });
 
-    child.on("error", (error) => {
-      this.handleProcessFailure(error.message);
-    });
-    child.once("close", (code, signal) => {
-      if (this.closing || this.processFailed) return;
-      this.handleProcessFailure(
-        `DSH process exited unexpectedly (${signal ?? code ?? "unknown"})${this.stderrTail ? `: ${this.stderrTail.trim().split("\n").at(-1)}` : ""}`,
-      );
-    });
+    if (child) {
+      child.stderr.on("data", (chunk: Buffer) => {
+        const text = chunk.toString("utf8");
+        this.stderrTail = (this.stderrTail + text).slice(-4096);
+      });
+      child.on("error", (error) => {
+        this.handleProcessFailure(error.message);
+      });
+      child.once("close", (code, signal) => {
+        if (this.closing || this.processFailed) return;
+        this.handleProcessFailure(
+          `DSH process exited unexpectedly (${signal ?? code ?? "unknown"})${this.stderrTail ? `: ${this.stderrTail.trim().split("\n").at(-1)}` : ""}`,
+        );
+      });
+    }
   }
 
   async open(
@@ -221,6 +292,7 @@ export class DshSessionRuntime {
   ): Promise<readonly ProviderCapability[]> {
     this.cwd = input.config.cwd;
     const mcpServers = toBridgeMcpServers(input.config.mcpServers);
+    this.mcpServers = mcpServers;
     const resumeId = readNativeSessionId(input.persistence);
     const rawState = resumeId
       ? await this.peer.request(
@@ -284,15 +356,19 @@ export class DshSessionRuntime {
     const { prompt } = input;
     if (prompt.input.type === "command") {
       try {
-        const raw = await this.peer.request("turn/prompt", {
-          sessionId: this.nativeSessionId,
-          delivery: "auto",
-          input: {
-            type: "command",
-            name: prompt.input.name,
-            arguments: prompt.input.arguments,
+        const raw = await this.peer.request(
+          "turn/prompt",
+          {
+            sessionId: this.nativeSessionId,
+            delivery: "auto",
+            input: {
+              type: "command",
+              name: prompt.input.name,
+              arguments: prompt.input.arguments,
+            },
           },
-        });
+          COMMAND_TIMEOUT_MS,
+        );
         const result = BridgeTurnPromptResultSchema.parse(raw);
         if (result.kind === "command") {
           if (result.text) {
@@ -352,11 +428,15 @@ export class DshSessionRuntime {
         });
         return;
       }
-      const raw = await this.peer.request("turn/prompt", {
-        sessionId: this.nativeSessionId,
-        delivery: "steer",
-        input: { type: "message", content: blocks },
-      });
+      const raw = await this.peer.request(
+        "turn/prompt",
+        {
+          sessionId: this.nativeSessionId,
+          delivery: "steer",
+          input: { type: "message", content: blocks },
+        },
+        PROMPT_TIMEOUT_MS,
+      );
       const result = BridgeTurnPromptResultSchema.parse(raw);
       this.emittedUserMessageIds.add(result.kind === "steer" ? result.messageId : prompt.clientMessageId);
       this.emit({
@@ -382,12 +462,25 @@ export class DshSessionRuntime {
     this.activeTurnId = turnId;
     this.pendingPromptClientMessageId = prompt.clientMessageId;
 
-    const raw = await this.peer.request("turn/prompt", {
-      sessionId: this.nativeSessionId,
-      delivery: "auto",
-      input: { type: "message", content: blocks },
-    });
-    const result = BridgeTurnPromptResultSchema.parse(raw);
+    let result;
+    try {
+      const raw = await this.peer.request(
+        "turn/prompt",
+        {
+          sessionId: this.nativeSessionId,
+          delivery: "auto",
+          input: { type: "message", content: blocks },
+        },
+        PROMPT_TIMEOUT_MS,
+      );
+      result = BridgeTurnPromptResultSchema.parse(raw);
+    } catch (error) {
+      if (this.activeTurnId === turnId) {
+        this.activeTurnId = null;
+        this.pendingPromptClientMessageId = null;
+      }
+      throw error;
+    }
     const messageId = result.kind === "turn" ? result.messageId : prompt.clientMessageId;
     this.emittedUserMessageIds.add(messageId);
 
@@ -478,21 +571,51 @@ export class DshSessionRuntime {
     if (beforeSeq === undefined || !Number.isSafeInteger(beforeSeq)) {
       throw new Error("Invalid DSH revert token: missing integer beforeSeq");
     }
+    const oldSessionId = this.nativeSessionId;
     const raw = await this.peer.request(
       "session/revert",
-      { sessionId: this.nativeSessionId, beforeSeq },
+      { sessionId: oldSessionId, beforeSeq },
       30_000,
     );
     const { newSessionId } = BridgeRevertResultSchema.parse(raw);
+
+    // Switch the live DSH runtime over to the forked session so subsequent prompts
+    // append to the new fork instead of the original session.
+    this.flushStreams();
+    this.cancelPendingPermissions();
+    this.emittedUserMessageIds.clear();
+    this.committedStreams.clear();
+    if (oldSessionId) {
+      await this.peer.request("session/close", { sessionId: oldSessionId }, 10_000).catch(() => {});
+    }
+    const rawResumed = await this.peer.request(
+      "session/resume",
+      {
+        sessionId: newSessionId,
+        cwd: this.cwd,
+        mcpServers: this.mcpServers,
+        ...(this.currentModelId ? { model: this.currentModelId } : {}),
+        ...(this.currentMode ? { mode: this.currentMode } : {}),
+        ...(this.currentThinkingOption ? { thinkingOption: this.currentThinkingOption } : {}),
+        history: "skip",
+      },
+      90_000,
+    );
+    const state = BridgeSessionStateSchema.parse(rawResumed);
+    this.nativeSessionId = state.sessionId;
+    this.imageSupported = state.imageSupported;
+
     this.emit({
       type: "session.persistence",
       sessionId: this.boundarySessionId,
-      persistence: nativePersistence(newSessionId),
+      persistence: nativePersistence(this.nativeSessionId),
     });
+    this.emitSessionState(state);
   }
 
   async close(terminalReason: "canceled" | "failed" = "canceled"): Promise<void> {
     if (this.closing) return;
+    this.flushStreams();
     this.closing = true;
     this.cancelPendingPermissions();
     this.terminalizeRunningTools(terminalReason);
@@ -520,8 +643,8 @@ export class DshSessionRuntime {
         .catch(() => {});
     }
     this.peer.close();
-    if (this.child.exitCode === null && this.child.signalCode === null) {
-      const closed = new Promise<void>((resolve) => this.child.once("close", () => resolve()));
+    if (this.child && this.child.exitCode === null && this.child.signalCode === null) {
+      const closed = new Promise<void>((resolve) => this.child!.once("close", () => resolve()));
       await terminateProcess(this.child, "SIGTERM");
       if (!(await settlesWithin(closed, 1_500))) {
         await terminateProcess(this.child);
@@ -594,10 +717,16 @@ export class DshSessionRuntime {
   }
 
   private emitSessionState(state: BridgeSessionState): void {
+    const config = toProviderConfigState(state);
+    this.currentModelId = config.model;
+    this.currentMode = config.mode;
+    this.currentThinkingOption = config.thinkingOption;
+    const activeModel = config.models.find((m) => m.id === config.model);
+    this.contextWindowMaxTokens = activeModel?.contextWindowMaxTokens;
     this.emit({
       type: "session.config",
       sessionId: this.boundarySessionId,
-      config: toProviderConfigState(state),
+      config,
     });
     if (state.commands.length > 0 || this.initInfo.capabilities.commands) {
       this.emit({
@@ -819,9 +948,12 @@ export class DshSessionRuntime {
     }
 
     if (method === "event/agent-error" && typeof rawParams.message === "string") {
+      this.flushStreams();
       if (this.activeTurnId) {
         const turnId = this.activeTurnId;
         this.activeTurnId = null;
+        this.pendingPromptClientMessageId = null;
+        this.emittedUserMessageIds.clear();
         this.terminalizeRunningTools("failed");
         this.emit({
           type: "session.turn",
@@ -835,52 +967,44 @@ export class DshSessionRuntime {
     }
   }
 
-  private processStreamFrame(targetSessionId: string, rawFrame: unknown): void {
-    if (!isRecord(rawFrame) || typeof rawFrame.attemptId !== "string") return;
-    const attemptId = rawFrame.attemptId;
-    const key = `${targetSessionId}:${attemptId}`;
-
-    if (rawFrame.type === "start") {
-      this.streamAttempts.set(key, {
-        textId: `stream:text:${attemptId}`,
-        text: "",
-        reasoningId: `stream:reasoning:${attemptId}`,
-        reasoning: "",
-      });
-      this.activeStreamKeyBySession.set(targetSessionId, key);
+  private scheduleStreamFlush(): void {
+    if (this.streamCoalesceMs <= 0) {
+      this.flushStreams();
       return;
     }
+    const elapsed = Date.now() - this.lastStreamFlushAt;
+    if (this.streamFlushTimer === null && elapsed >= this.streamCoalesceMs) {
+      this.flushStreams();
+      return;
+    }
+    if (this.streamFlushTimer !== null) return;
+    const delay = Math.max(1, this.streamCoalesceMs - elapsed);
+    this.streamFlushTimer = setTimeout(() => {
+      this.streamFlushTimer = null;
+      this.flushStreams();
+    }, delay);
+  }
 
-    if (rawFrame.type === "chunk" && isRecord(rawFrame.chunk)) {
-      const attempt = this.streamAttempts.get(key) ?? {
-        textId: `stream:text:${attemptId}`,
-        text: "",
-        reasoningId: `stream:reasoning:${attemptId}`,
-        reasoning: "",
-      };
-      this.streamAttempts.set(key, attempt);
-      this.activeStreamKeyBySession.set(targetSessionId, key);
-      const chunk = rawFrame.chunk;
-      if (chunk.type === "text-delta" && typeof chunk.text === "string" && chunk.text.length > 0) {
-        attempt.text += chunk.text;
+  private flushStreams(filterSessionId?: string): void {
+    if (filterSessionId === undefined && this.streamFlushTimer !== null) {
+      clearTimeout(this.streamFlushTimer);
+      this.streamFlushTimer = null;
+    }
+    let flushedAny = false;
+    for (const key of [...this.dirtyStreamKeys]) {
+      const attempt = this.streamAttempts.get(key);
+      if (!attempt) {
+        this.dirtyStreamKeys.delete(key);
+        continue;
+      }
+      if (filterSessionId !== undefined && attempt.targetSessionId !== filterSessionId) continue;
+      this.dirtyStreamKeys.delete(key);
+      if (attempt.dirtyReasoning && attempt.reasoning.length > 0) {
+        attempt.dirtyReasoning = false;
+        flushedAny = true;
         this.emit({
           type: "timeline.item",
-          sessionId: targetSessionId,
-          item: {
-            type: "assistant_message",
-            id: attempt.textId,
-            text: attempt.text,
-          },
-        });
-      } else if (
-        chunk.type === "reasoning-delta" &&
-        typeof chunk.text === "string" &&
-        chunk.text.length > 0
-      ) {
-        attempt.reasoning += chunk.text;
-        this.emit({
-          type: "timeline.item",
-          sessionId: targetSessionId,
+          sessionId: attempt.targetSessionId,
           item: {
             type: "reasoning",
             id: attempt.reasoningId,
@@ -888,12 +1012,80 @@ export class DshSessionRuntime {
           },
         });
       }
+      if (attempt.dirtyText && attempt.text.length > 0) {
+        attempt.dirtyText = false;
+        flushedAny = true;
+        this.emit({
+          type: "timeline.item",
+          sessionId: attempt.targetSessionId,
+          item: {
+            type: "assistant_message",
+            id: attempt.textId,
+            text: attempt.text,
+          },
+        });
+      }
+    }
+    if (flushedAny) {
+      this.lastStreamFlushAt = Date.now();
+    }
+  }
+
+  private processStreamFrame(targetSessionId: string, rawFrame: unknown): void {
+    if (!isRecord(rawFrame) || typeof rawFrame.attemptId !== "string") return;
+    const attemptId = rawFrame.attemptId;
+    const key = `${targetSessionId}:${attemptId}`;
+
+    if (rawFrame.type === "start") {
+      this.streamAttempts.set(key, {
+        targetSessionId,
+        textId: `stream:text:${attemptId}`,
+        text: "",
+        dirtyText: false,
+        reasoningId: `stream:reasoning:${attemptId}`,
+        reasoning: "",
+        dirtyReasoning: false,
+      });
+      this.activeStreamKeyBySession.set(targetSessionId, key);
+      return;
+    }
+
+    if (rawFrame.type === "chunk" && isRecord(rawFrame.chunk)) {
+      const attempt = this.streamAttempts.get(key) ?? {
+        targetSessionId,
+        textId: `stream:text:${attemptId}`,
+        text: "",
+        dirtyText: false,
+        reasoningId: `stream:reasoning:${attemptId}`,
+        reasoning: "",
+        dirtyReasoning: false,
+      };
+      this.streamAttempts.set(key, attempt);
+      this.activeStreamKeyBySession.set(targetSessionId, key);
+      const chunk = rawFrame.chunk;
+      if (chunk.type === "text-delta" && typeof chunk.text === "string" && chunk.text.length > 0) {
+        attempt.text += chunk.text;
+        attempt.dirtyText = true;
+        this.dirtyStreamKeys.add(key);
+        this.scheduleStreamFlush();
+      } else if (
+        chunk.type === "reasoning-delta" &&
+        typeof chunk.text === "string" &&
+        chunk.text.length > 0
+      ) {
+        attempt.reasoning += chunk.text;
+        attempt.dirtyReasoning = true;
+        this.dirtyStreamKeys.add(key);
+        this.scheduleStreamFlush();
+      }
       return;
     }
 
     if (rawFrame.type === "end") {
+      this.flushStreams(targetSessionId);
       const attempt = this.streamAttempts.get(key);
       this.streamAttempts.delete(key);
+      this.dirtyStreamKeys.delete(key);
       if (this.activeStreamKeyBySession.get(targetSessionId) === key) {
         this.activeStreamKeyBySession.delete(targetSessionId);
       }
@@ -917,7 +1109,7 @@ export class DshSessionRuntime {
       const source = isRecord(data.source) ? data.source : undefined;
       if (source?.kind !== "user") return;
       const msgId = typeof data.id === "string" ? data.id : `user:${seq ?? randomUUID()}`;
-      const text = extractToolOutputText(data.content) ?? "";
+      const text = extractUserMessageText(data.content);
       const clientMessageId =
         !isReplay && this.pendingPromptClientMessageId && this.emittedUserMessageIds.has(msgId)
           ? this.pendingPromptClientMessageId
@@ -937,6 +1129,7 @@ export class DshSessionRuntime {
     }
 
     if (type === "assistant/message") {
+      if (!isReplay) this.flushStreams(targetSessionId);
       const message = isRecord(data.message) ? data.message : {};
       const msgId = typeof message.id === "string" ? message.id : `assistant:${seq ?? randomUUID()}`;
       const content = Array.isArray(message.content) ? message.content : [];
@@ -989,16 +1182,28 @@ export class DshSessionRuntime {
 
       const usage = isRecord(data.usage) ? data.usage : isRecord(message.usage) ? message.usage : undefined;
       if (usage && !isReplay && targetSessionId === this.boundarySessionId) {
+        const inputTokens = typeof usage.inputTokens === "number" ? usage.inputTokens : undefined;
+        const outputTokens = typeof usage.outputTokens === "number" ? usage.outputTokens : undefined;
+        const cachedInputTokens =
+          typeof usage.cachedInputTokens === "number" ? usage.cachedInputTokens : undefined;
+        const totalCostUsd = typeof usage.totalCostUsd === "number" ? usage.totalCostUsd : undefined;
+        const contextWindowUsedTokens =
+          typeof usage.contextWindowUsedTokens === "number"
+            ? usage.contextWindowUsedTokens
+            : inputTokens;
         this.emit({
           type: "session.usage",
           sessionId: this.boundarySessionId,
           ...(this.activeTurnId ? { turnId: this.activeTurnId } : {}),
           usage: {
-            ...(typeof usage.inputTokens === "number" ? { inputTokens: usage.inputTokens } : {}),
-            ...(typeof usage.outputTokens === "number" ? { outputTokens: usage.outputTokens } : {}),
-            ...(typeof usage.cachedInputTokens === "number"
-              ? { cachedInputTokens: usage.cachedInputTokens }
+            ...(inputTokens !== undefined ? { inputTokens } : {}),
+            ...(outputTokens !== undefined ? { outputTokens } : {}),
+            ...(cachedInputTokens !== undefined ? { cachedInputTokens } : {}),
+            ...(totalCostUsd !== undefined ? { totalCostUsd } : {}),
+            ...(this.contextWindowMaxTokens !== undefined
+              ? { contextWindowMaxTokens: this.contextWindowMaxTokens }
               : {}),
+            ...(contextWindowUsedTokens !== undefined ? { contextWindowUsedTokens } : {}),
           },
         });
       }
@@ -1006,6 +1211,7 @@ export class DshSessionRuntime {
     }
 
     if (type === "tool/call") {
+      if (!isReplay) this.flushStreams(targetSessionId);
       const callId = typeof data.callId === "string" ? data.callId : `tool:${seq ?? randomUUID()}`;
       const name = typeof data.name === "string" ? data.name : "tool";
       const parsedInput = parseToolArguments(data.arguments);
@@ -1083,14 +1289,16 @@ export class DshSessionRuntime {
     }
 
     if (type === "turn/end" && !isReplay && targetSessionId === this.boundarySessionId) {
+      this.flushStreams(targetSessionId);
       const reason = isRecord(data.reason) ? data.reason : {};
       const kind = typeof reason.kind === "string" ? reason.kind : "completed";
       const turnId = this.activeTurnId;
       this.activeTurnId = null;
       this.pendingPromptClientMessageId = null;
+      this.emittedUserMessageIds.clear();
       this.cancelPendingPermissions();
 
-      if (kind === "cancelled" || kind === "canceled") {
+      if (kind === "aborted" || kind === "cancelled" || kind === "canceled") {
         this.terminalizeRunningTools("canceled");
         if (turnId) {
           this.emit({

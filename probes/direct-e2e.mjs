@@ -493,7 +493,8 @@ try {
   });
   await client.until((e) => e.type === "session.ready" && e.sessionId === "s-fork", replayStart);
   const replayedUsers = client.events.slice(replayStart).filter((e) => e.type === "timeline.item" && e.item.type === "user_message");
-  assert.equal(replayedUsers.length, 1, `Reverted fork should replay only 1 user message, got ${replayedUsers.length}`);
+  assert.equal(replayedUsers.length, 2, `Reverted fork should replay 1 pre-revert message + 1 post-revert hang-tool prompt, got ${replayedUsers.length}`);
+  assert.equal(replayedUsers[1].item.text, "hang-tool", "Post-revert prompt must be recorded on the forked session");
 
   await client.conn.send({
     type: "session.open",

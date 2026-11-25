@@ -51,6 +51,20 @@ export function extractToolOutputText(content: unknown): string | undefined {
   return parts.length > 0 ? parts.join("\n") : undefined;
 }
 
+export function extractUserMessageText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const parts: string[] = [];
+  for (const block of content) {
+    if (isRecord(block) && block.type === "text" && typeof block.text === "string") {
+      parts.push(block.text);
+    } else if (isRecord(block) && block.type === "image") {
+      parts.push("[image]");
+    }
+  }
+  return parts.join("\n");
+}
+
 function normalizeToolName(name: string): string {
   return name.trim().toLowerCase();
 }

@@ -14,14 +14,20 @@ import {
 import { toProviderCatalog } from "./mappers/config.ts";
 import { defaultDshLaunch } from "./launch.ts";
 import { BridgeCatalogResultSchema, BridgeSessionListResultSchema } from "./protocol.ts";
-import { DshSessionRuntime, nativePersistence } from "./session.ts";
+import { DshSessionRuntime, nativePersistence, type DshSessionRuntimeOptions } from "./session.ts";
 
 const STARTUP_TIMEOUT_MS = 90_000;
+const UTILITY_IDLE_TIMEOUT_MS = 60_000;
 
 interface ActiveSession {
   runtime: DshSessionRuntime;
   capabilities: readonly ProviderCapability[];
   mutationLane: Promise<void>;
+}
+
+export interface DirectDshConnectionOptions {
+  startRuntime?: (options: DshSessionRuntimeOptions) => Promise<DshSessionRuntime>;
+  utilityIdleTimeoutMs?: number;
 }
 
 function describeError(error: unknown): string {
@@ -30,22 +36,30 @@ function describeError(error: unknown): string {
 
 export async function createDirectDshConnection(
   request: ProviderConnectRequest,
+  options: DirectDshConnectionOptions = {},
 ): Promise<ProviderConnection> {
   if (!request.versions.includes(PROVIDER_PROTOCOL_VERSION)) {
     throw new Error(`DSH direct provider requires protocol version ${PROVIDER_PROTOCOL_VERSION}`);
   }
   const baseLaunch: ProviderLaunch = request.launch ?? defaultDshLaunch("acp");
+  const startRuntime = options.startRuntime ?? ((opts: DshSessionRuntimeOptions) => DshSessionRuntime.start(opts));
+  const utilityIdleTimeoutMs = options.utilityIdleTimeoutMs ?? UTILITY_IDLE_TIMEOUT_MS;
+  const validateAllEvents = process.env.PASEO_DSH_VALIDATE_EVENTS === "1";
 
-  // Short-lived probe process to verify DSH bridge and discover supported capabilities.
-  const probe = await DshSessionRuntime.start({
-    boundarySessionId: "capability-probe",
+  // Start a utility bridge runtime to discover capabilities, and keep it warm for
+  // subsequent catalog/session-list requests instead of respawning per call.
+  let utilityRuntime: DshSessionRuntime | null = await startRuntime({
+    boundarySessionId: "utility",
     baseLaunch,
     env: {},
     startupTimeoutMs: STARTUP_TIMEOUT_MS,
     emit: () => undefined,
   });
-  const initCaps = probe.initInfo.capabilities;
-  await probe.close();
+  let utilityStartPromise: Promise<DshSessionRuntime> | null = null;
+  let utilityInUse = 0;
+  let utilityIdleTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const initCaps = utilityRuntime.initInfo.capabilities;
 
   const supported: ProviderCapability[] = [
     "prompt.message",
@@ -64,13 +78,91 @@ export async function createDirectDshConnection(
   const listeners = new Set<(event: ProviderEvent) => void>();
   const sessions = new Map<string, ActiveSession>();
   const inFlight = new Set<Promise<void>>();
+  let closing = false;
   let closed = false;
   let closePromise: Promise<void> | null = null;
 
+  function clearUtilityIdleTimer(): void {
+    if (utilityIdleTimer !== null) {
+      clearTimeout(utilityIdleTimer);
+      utilityIdleTimer = null;
+    }
+  }
+
+  function scheduleUtilityIdleClose(): void {
+    clearUtilityIdleTimer();
+    if (closing || closed || utilityInUse > 0 || !utilityRuntime) return;
+    if (utilityIdleTimeoutMs <= 0) {
+      const rt = utilityRuntime;
+      utilityRuntime = null;
+      void rt.close().catch(() => {});
+      return;
+    }
+    utilityIdleTimer = setTimeout(() => {
+      utilityIdleTimer = null;
+      if (utilityInUse > 0 || !utilityRuntime) return;
+      const rt = utilityRuntime;
+      utilityRuntime = null;
+      void rt.close().catch(() => {});
+    }, utilityIdleTimeoutMs);
+    utilityIdleTimer.unref?.();
+  }
+
+  // Schedule idle teardown of the initial capability-probe runtime if unused.
+  scheduleUtilityIdleClose();
+
+  async function withUtilityRuntime<T>(fn: (runtime: DshSessionRuntime) => Promise<T>): Promise<T> {
+    clearUtilityIdleTimer();
+    utilityInUse++;
+    try {
+      let rt = utilityRuntime;
+      if (!rt) {
+        if (!utilityStartPromise) {
+          utilityStartPromise = startRuntime({
+            boundarySessionId: "utility",
+            baseLaunch,
+            env: {},
+            startupTimeoutMs: STARTUP_TIMEOUT_MS,
+            emit: () => undefined,
+          }).then(
+            (started) => {
+              utilityRuntime = started;
+              utilityStartPromise = null;
+              return started;
+            },
+            (error) => {
+              utilityStartPromise = null;
+              throw error;
+            },
+          );
+        }
+        rt = await utilityStartPromise;
+      }
+      try {
+        return await fn(rt);
+      } catch (error) {
+        // Discard a broken utility runtime so the next call gets a fresh one.
+        if (utilityRuntime === rt) {
+          utilityRuntime = null;
+          void rt.close("failed").catch(() => {});
+        }
+        throw error;
+      }
+    } finally {
+      utilityInUse--;
+      scheduleUtilityIdleClose();
+    }
+  }
+
   const emit = (event: ProviderEvent) => {
     if (closed) return;
-    const parsed = ProviderEventSchema.parse(event);
-    for (const listener of listeners) listener(parsed);
+    const isHotStreamEvent =
+      !validateAllEvents &&
+      event.type === "timeline.item" &&
+      (event.item.type === "assistant_message" || event.item.type === "reasoning") &&
+      event.item.id.startsWith("stream:");
+    const validated = isHotStreamEvent ? event : ProviderEventSchema.parse(event);
+    for (const listener of listeners) listener(validated);
   };
 
   async function mutateSession(session: ActiveSession, op: () => Promise<void>): Promise<void> {
@@ -132,32 +224,16 @@ export async function createDirectDshConnection(
           });
           return;
         }
-        const runtime = await DshSessionRuntime.start({
-          boundarySessionId: "catalog",
-          baseLaunch,
-          env: {},
-          startupTimeoutMs: STARTUP_TIMEOUT_MS,
-          emit: () => undefined,
-        });
-        try {
+        const catalog = await withUtilityRuntime(async (runtime) => {
           const rawCatalog = await runtime.peer.request("catalog/get", {}, 30_000);
-          const catalog = toProviderCatalog(BridgeCatalogResultSchema.parse(rawCatalog));
-          emit({ type: "catalog", requestId: input.requestId, catalog });
-        } finally {
-          await runtime.close();
-        }
+          return toProviderCatalog(BridgeCatalogResultSchema.parse(rawCatalog));
+        });
+        emit({ type: "catalog", requestId: input.requestId, catalog });
         return;
       }
 
       case "sessions": {
-        const runtime = await DshSessionRuntime.start({
-          boundarySessionId: "sessions",
-          baseLaunch,
-          env: {},
-          startupTimeoutMs: STARTUP_TIMEOUT_MS,
-          emit: () => undefined,
-        });
-        try {
+        const list = await withUtilityRuntime(async (runtime) => {
           const rawList = await runtime.peer.request(
             "session/list",
             {
@@ -166,39 +242,41 @@ export async function createDirectDshConnection(
             },
             30_000,
           );
-          const list = BridgeSessionListResultSchema.parse(rawList);
-          emit({
-            type: "sessions",
-            requestId: input.requestId,
-            sessions: list.sessions.map((item) => ({
-              persistence: nativePersistence(item.sessionId),
-              cwd: item.cwd,
-              ...(item.title ? { title: item.title } : {}),
-              ...(item.updatedAt
-                ? { updatedAt: new Date(item.updatedAt).toISOString() }
-                : item.createdAt
-                  ? { updatedAt: new Date(item.createdAt).toISOString() }
-                  : {}),
-            })),
-          });
-        } finally {
-          await runtime.close();
-        }
+          return BridgeSessionListResultSchema.parse(rawList);
+        });
+        emit({
+          type: "sessions",
+          requestId: input.requestId,
+          sessions: list.sessions.map((item) => ({
+            persistence: nativePersistence(item.sessionId),
+            cwd: item.cwd,
+            ...(item.title ? { title: item.title } : {}),
+            ...(item.updatedAt
+              ? { updatedAt: new Date(item.updatedAt).toISOString() }
+              : item.createdAt
+                ? { updatedAt: new Date(item.createdAt).toISOString() }
+                : {}),
+          })),
+        });
         return;
       }
 
       case "session.open": {
-        const runtime = await DshSessionRuntime.start({
+        const runtime = await startRuntime({
           boundarySessionId: input.sessionId,
           baseLaunch,
           env: input.config.env,
           startupTimeoutMs: STARTUP_TIMEOUT_MS,
           emit,
         });
+        if (closing || closed) {
+          await runtime.close("canceled");
+          return;
+        }
         try {
           const sessionCapabilities = await runtime.open(input, capabilities);
-          if (closed) {
-            await runtime.close();
+          if (closing || closed) {
+            await runtime.close("canceled");
             return;
           }
           sessions.set(input.sessionId, {
@@ -207,7 +285,7 @@ export async function createDirectDshConnection(
             mutationLane: Promise.resolve(),
           });
         } catch (error) {
-          await runtime.close();
+          await runtime.close("failed");
           throw error;
         }
         return;
@@ -270,11 +348,11 @@ export async function createDirectDshConnection(
     version: PROVIDER_PROTOCOL_VERSION,
     capabilities,
     async send(rawInput) {
-      if (closed) throw new Error("DSH provider connection is closed");
+      if (closing || closed) throw new Error("DSH provider connection is closed");
       const input = ProviderInputSchema.parse(rawInput);
       validateAdmission(input);
       const operation = Promise.resolve().then(async () => {
-        if (closed) return;
+        if (closing || closed) return;
         await dispatch(input);
       });
       const settled = operation.catch((error) => {
@@ -291,18 +369,33 @@ export async function createDirectDshConnection(
     },
     async close() {
       if (closePromise) return closePromise;
+      closing = true;
+      clearUtilityIdleTimer();
       closePromise = (async () => {
         // Terminalize active sessions while listeners can still observe terminal tool/turn items.
-        const active = [...sessions.entries()];
-        sessions.clear();
-        await Promise.all(
-          active.map(async ([sessionId, { runtime }]) => {
-            await runtime.close("failed");
-            emit({ type: "session.closed", sessionId });
-          }),
-        );
-        closed = true;
+        const drainSessions = async () => {
+          const active = [...sessions.entries()];
+          sessions.clear();
+          await Promise.all(
+            active.map(async ([sessionId, { runtime }]) => {
+              await runtime.close("failed");
+              emit({ type: "session.closed", sessionId });
+            }),
+          );
+        };
+        await drainSessions();
         await Promise.allSettled(inFlight);
+        // Defensively drain any session that raced with close().
+        await drainSessions();
+        if (utilityStartPromise) {
+          await utilityStartPromise.catch(() => undefined);
+        }
+        if (utilityRuntime) {
+          const rt = utilityRuntime;
+          utilityRuntime = null;
+          await rt.close("canceled").catch(() => {});
+        }
+        closed = true;
         listeners.clear();
       })();
       return closePromise;
